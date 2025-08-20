@@ -1,0 +1,29 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: "ubuntu-latest"
+
+steps:
+  - task: Maven@3
+    inputs:
+      mavenPomFile: "pom.xml"
+      goals: "clean package"
+
+  - script: docker build -t myacr.azurecr.io/java-gitops-app:$(Build.BuildId) .
+    displayName: Build Docker Image
+
+  - script: docker push myacr.azurecr.io/java-gitops-app:$(Build.BuildId)
+    displayName: Push to ACR
+
+  - script: |
+      chmod +x trivy-scan.sh
+      ./trivy-scan.sh
+    displayName: Run Trivy Scan
+
+  - script: |
+      chmod +x zap-scan.sh
+      ./zap-scan.sh
+    displayName: Run OWASP ZAP Scan
