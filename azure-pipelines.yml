@@ -1,72 +1,130 @@
 trigger:
-- main   
+- main
 
 variables:
-- group: gitops-variables   # contains your GitHub PAT as GITOPS_INFRA_PAT
+  imageName: java-gitops-app
+  imageTag: "$(Build.BuildId)"
+  acrLoginServer: gitopsacr12345.azurecr.io
+  acrServiceConnection: gitops-acr-conn
+  gitOpsRepoUrl: https://$(GITOPS_INFRA_PAT)@github.com/Poojass1998/gitops-infra.git
+  gitOpsManifestPath: k8s/deployment.yaml
 
 stages:
+
+# -------------------------
+# 1. Build with Maven
+# -------------------------
 - stage: Build
+  displayName: Build (Maven)
   jobs:
-  - job: Build
+  - job: BuildJob
+    displayName: Build & Test
     pool:
-      vmImage: 'ubuntu-latest'
+      name: Default
+      demands:
+        - agent.name -equals JavaVM
     steps:
+    - checkout: self
     - task: Maven@3
       inputs:
         mavenPomFile: 'pom.xml'
-        goals: 'package'
-      displayName: "Build Java App with Maven"
-
-    - task: PublishBuildArtifacts@1
+        goals: 'clean package'
+      displayName: "Compile & Package"
+    - task: PublishTestResults@2
       inputs:
-        pathToPublish: '$(System.DefaultWorkingDirectory)/target'
-        artifactName: 'drop'
-      displayName: "Publish Build Artifacts"
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+        testResultsFormat: 'JUnit'
+        failTaskOnFailedTests: true
+      displayName: "Publish Test Results"
 
+# -------------------------
+# 2. Build & Push Docker Image
+# -------------------------
+- stage: DockerBuildPush
+  displayName: Docker Build & Push
+  dependsOn: Build
+  jobs:
+  - job: DockerJob
+    displayName: Build & Push to ACR
+    pool:
+      name: Default
+      demands:
+        - agent.name -equals JavaVM
+    steps:
+    - checkout: self
     - task: Docker@2
-      displayName: "Build and Push Docker Image"
+      displayName: Build and Push Docker Image
       inputs:
-        containerRegistry: "gitops-acr-conn"   # your ACR service connection
-        repository: "java-gitops-app"
-        command: "buildAndPush"
-        Dockerfile: "Dockerfile"
+        containerRegistry: $(acrServiceConnection)
+        repository: $(imageName)
+        command: buildAndPush
+        Dockerfile: 'Dockerfile'
         tags: |
-          $(Build.BuildId)
+          $(imageTag)
 
+# -------------------------
+# 3. Trivy Vulnerability Scan
+# -------------------------
+- stage: TrivyScan
+  displayName: Run Trivy Scan
+  dependsOn: DockerBuildPush
+  jobs:
+  - job: TrivyJob
+    displayName: Vulnerability Scan
+    pool:
+      name: Default
+      demands:
+        - agent.name -equals JavaVM
+    steps:
     - script: |
         chmod +x trivy-scan.sh
-        ./trivy-scan.sh
-      displayName: "Run Trivy Scan"
+        ./trivy-scan.sh $(acrLoginServer)/$(imageName):$(imageTag)
+      displayName: "Trivy Scan"
 
+# -------------------------
+# 4. OWASP ZAP (DAST) Scan
+# -------------------------
+- stage: ZapScan
+  displayName: Run ZAP Scan
+  dependsOn: TrivyScan
+  jobs:
+  - job: ZapJob
+    displayName: DAST with ZAP
+    pool:
+      name: Default
+      demands:
+        - agent.name -equals JavaVM
+    steps:
     - script: |
         chmod +x zap-scan.sh
         ./zap-scan.sh
-      displayName: "Run OWASP ZAP Scan"
+      displayName: "OWASP ZAP Scan"
 
-- stage: Deploy
-  dependsOn: Build
+# -------------------------
+# 5. Update ArgoCD GitOps Manifest
+# -------------------------
+- stage: UpdateManifest
+  displayName: Update Deployment for ArgoCD
+  dependsOn: ZapScan
   jobs:
-  - job: Deploy
+  - job: ManifestJob
+    displayName: Update k8s deployment.yaml
     pool:
-      vmImage: 'ubuntu-latest'
+      name: Default
+      demands:
+        - agent.name -equals JavaVM
     steps:
     - checkout: self
-
     - script: |
-        echo "Updating GitOps manifests in GitHub repo..."
-        git config --global user.email "azure-pipelines@devops.com"
-        git config --global user.name "Azure Pipelines"
-
-        # Clone infra repo from GitHub using PAT
-        git clone https://$(GITOPS_INFRA_PAT)@github.com/Poojass1998/gitops-infra.git
-
+        echo "Cloning GitOps repo..."
+        git clone $(gitOpsRepoUrl) gitops-infra
         cd gitops-infra
-
-        # Update deployment.yaml with new Docker image tag
-        sed -i "s|image: .*|image: gitopsacr12345.azurecr.io/java-gitops-app:$(Build.BuildId)|" k8s/deployment.yaml
-
-        git add .
-        git commit -m "Update image to build $(Build.BuildId)"
+        echo "Updating image tag to $(imageTag)..."
+        sed -i "s|image:.*|image: $(acrLoginServer)/$(imageName):$(imageTag)|" $(gitOpsManifestPath)
+        git config user.email "azure-pipelines@devops.com"
+        git config user.name "Azure Pipelines"
+        git add $(gitOpsManifestPath)
+        git commit -m "Update image to $(imageTag)"
         git push origin main
-      displayName: "Update GitOps repo with new image"
+      displayName: "Commit & Push Manifest Update"
 
